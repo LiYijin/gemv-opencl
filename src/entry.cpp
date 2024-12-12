@@ -3,7 +3,8 @@
 
 #define MSTRINGIFY(...) #__VA_ARGS__
 #define FETCH_PER_WI 16
-#define BUILD_OPTIONS " -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math -Dgroup_size="
+#define BUILD_OPTIONS " -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math"
+// #define BUILD_OPTIONS " -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math -Dgroup_size="
 
 #define PRINT(...) print(__VA_ARGS__)
 
@@ -13,8 +14,6 @@ void print(T arg, Args... args) {
 }
 static const std::string stringifiedKernels =
 #include "gemm.cl"
-#include "gemmv1.cl"
-#include "gemmv2.cl"
     ;
 
 
@@ -39,57 +38,25 @@ double run_kernel(cl::CommandQueue &queue, cl::Kernel &kernel, cl::NDRange &glob
   return (timed / static_cast<float>(iters));
 }
 
-void gemm_int4_fp32(const uint8_t* A, const float* B, float* scale, float* C, const int m, const int k, const int n, const int group_size) {
-  const int scale_per_row = k / group_size;
+void gemv_int4_fp32(const uint8_t* A, const float* B, const float* scale, const float* bias, float* C, const int m, const int n, const int group_size) {
+  const int scale_per_row = n / group_size;
   for (int row = 0; row < m; row++) {
-    for (int col = 0; col < n; col++) {
-      float acc = 0;
-      for (int t = 0; t < k; t += 2) {
-        float s = scale[row * scale_per_row + t / group_size];
-        uint8_t a = A[(row * k + t) / 2];
-        float a0 = ((a & 0x0f) - 8) * s;
-        float a1 = (((a >> 4) & 0x0f) - 8) * s; 
-        float b0 = B[t * n + col];
-        float b1 = B[(t + 1) * n + col];
+    float acc = 0;
+    for (int s = 0; s < scale_per_row; s++) {
+      float sc = scale[row * scale_per_row + s];
+      for (int k = s * group_size; k < (s + 1) * group_size; k += 2) {
+        char a = A[(row * n + k) / 2];
+        float a0 = ((a & 0x0f) - 8) * sc;
+        float a1 = (((a >> 4) & 0x0f) - 8) * sc; 
+        float b0 = B[k];
+        float b1 = B[k + 1];
         acc += a0 * b0 + a1 * b1;
       }
-      C[row * n + col] = acc;
-      // printf("%.3f, ", acc);
     }
+    C[row] = acc + bias[row];
   }
 }
 
-void gemm_add_q4_gs32(const uint8_t * A, const float * B, float* scale, float* C, float* Bias, const int m, const int k, const int n) {
-  const int scale_per_row = k / 32;
-  for (int row = 0; row < m; row++) {
-    for (int col = 0; col < n; col++) {
-      float acc = Bias[row * n + col];
-      for (int t = 0; t < k; t += 32) {
-        float s = scale[row * scale_per_row + t / 32];
-
-        float b[32];
-        for (int i = 0; i < 32; i++) {
-          b[i] = B[(t + i) * n + col];
-        }
-          
-        
-        float a_v[32];
-        for (int i = 0; i < 16; i++) {
-          uint8_t a = A[(row * k / 2 + t / 2) + i];
-          a_v[i] = ((a & 0x0f) - 8);
-          a_v[16 + i] = ((a >> 4  & 0x0f) - 8);
-        }
-
-        for (int i = 0; i < 32; i++) {
-          acc += s * b[i] * a_v[i];
-        }
-      
-      }
-
-      C[row * n + col] = acc;
-    }
-  }
-}
 
 // if flag = true then transpose else jusr copy ori to after
 void matrix_transpose(const float * ori, float * after, int m, int n, bool flag = true) {
@@ -110,22 +77,22 @@ void matrix_transpose(const float * ori, float * after, int m, int n, bool flag 
 }
 
 
-void initializeData(uint8_t* A, float* B, float* scale, float* C, float* Bias, const int m, const int k, const int n, const int group_size) {
-  for (int i = 0; i < m * k / 2; i++) {
-    A[i] = rand() % 256;
+void initializeData(uint8_t* A, float* B, float* scale, float* C, float* bias, const int m, const int n, const int group_size) {
+  for (int i = 0; i < m * n / 2; i++) {
+    A[i] = 1;//rand() % 256;
   }
-  for (int i = 0; i < n * k; i++) {
-    B[i] = rand() % 1024;
-    
+  for (int i = 0; i < n; i++) {
+    B[i] = 1;//rand() % 1024;
+
   }
-  for (int i = 0; i < m * n; i++) {
+  for (int i = 0; i < n; i++) {
     C[i] = 1;
   }
-  for (int i = 0; i < m * n; i++) {
-    Bias[i] = rand() % 1024;
+  for (int i = 0; i < n; i++) {
+    bias[i] = 1;//rand() % 1024;
   }
-  for (int i = 0; i < m * k / group_size; i++) {
-    scale[i] = rand() % 10;
+  for (int i = 0; i < m * n / group_size; i++) {
+    scale[i] = 1;//rand() % 10;
   }
 }
 
@@ -145,27 +112,24 @@ void row_major2column_major(T* A, const int m, const int k) {
 
 int main(int argc, char **argv)
 {
+    // gemv, A[m, n], B[n,1], C[m,1]
     vector<cl::Platform> platforms;
     cl::Platform::get(&platforms);
     const int m = 4096;
-    const int k = 4096;
-    const int n = 512;
+    // const int k = 4096;
+    const int n = 4096;
     const int group_size = 128;
-    const int iters = 10;
-    uint8_t* A = (uint8_t*)malloc(m * k * sizeof(uint8_t) / 2);
-    float* scale = (float*)malloc(m * k / group_size * sizeof(float));
+    const int iters = 1;
+    uint8_t* A = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
+    float* scale = (float*)malloc(m * n / group_size * sizeof(float));
 
-    float* B = (float*)malloc(k * n * sizeof(float));
-    float* Bias = (float*)malloc(m * n * sizeof(float));
-    float* C = (float*)malloc(m * n * sizeof(float));
-    float* C_expect = (float*)malloc(m * n * sizeof(float));
+    float* B = (float*)malloc(n * sizeof(float));
+    float* bias = (float*)malloc(m * sizeof(float));
+    float* C = (float*)malloc(m * sizeof(float));
+    float* C_expect = (float*)malloc(m * sizeof(float));
 
-    float* B_T = (float*)malloc(k * n * sizeof(float));
-    float* Bias_T = (float*)malloc(m * n * sizeof(float));
-    float* C_T = (float*)malloc(m * n * sizeof(float));
+    initializeData(A, B, scale, C, bias, m, n, group_size);
 
-    initializeData(A, B, scale, C, Bias, m, k, n, group_size);
-    
 
     // row_major2column_major(A, m, k / 2);
     // row_major2column_major(B, k, n);
@@ -179,12 +143,13 @@ int main(int argc, char **argv)
         std::cout << kernel_string;
         cl::Program::Sources source(1, kernel_string);
         cl::Program prog = cl::Program(ctx, source);
-        std::string compile_opts = BUILD_OPTIONS + std::to_string(group_size);
+        // std::string compile_opts = BUILD_OPTIONS + std::to_string(group_size);
+        std::string compile_opts = BUILD_OPTIONS;
         for (size_t d = 0; d < 1/*devices.size()*/; d++)
         {
             PRINT("*****************THIS IS A NEW DEVICE***********************\n");
             device_info_t devInfo = getDeviceInfo(devices[d]);
-            
+
             try
             {
                 vector<cl::Device> dev = {devices[d]};
@@ -225,119 +190,65 @@ int main(int argc, char **argv)
 
             cl::CommandQueue queue = cl::CommandQueue(ctx, devices[d], CL_QUEUE_PROFILING_ENABLE);
 
-            cl::Buffer ABuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, (m * k / 2));
-            cl::Buffer scaleBuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, m * k / group_size * sizeof(float));
-            cl::Buffer BBuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, k * n * sizeof(float));
-            cl::Buffer CBuf = cl::Buffer(ctx, CL_MEM_READ_WRITE, m * n * sizeof(float));
-            cl::Buffer BiasBuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, m * n * sizeof(float));
+            cl::Buffer ABuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, (m * n / 2));
+            cl::Buffer scaleBuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, m * n / group_size * sizeof(float));
+            cl::Buffer BBuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, n * sizeof(float));
+            cl::Buffer CBuf = cl::Buffer(ctx, CL_MEM_READ_WRITE, m * sizeof(float));
+            cl::Buffer biasBuf = cl::Buffer(ctx, CL_MEM_READ_ONLY, m * sizeof(float));
 
-            queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * k / 2, A);
-            queue.enqueueWriteBuffer(scaleBuf, CL_TRUE, 0, m * k / group_size * sizeof(float), scale);
-            
+            queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A);
+            queue.enqueueWriteBuffer(scaleBuf, CL_TRUE, 0, m * n / group_size * sizeof(float), scale);
+            queue.enqueueWriteBuffer(BBuf, CL_TRUE, 0, n * sizeof(float), B);
+            queue.enqueueWriteBuffer(biasBuf, CL_TRUE, 0, m * sizeof(float), bias);            
             double timed = 0.0;
 
             cl::NDRange globalSize, localSize;
 
-            cl::Kernel kernel_gemm(prog, "gemm_int4_fp32");
-            cl::Kernel kernel_gemm_v1(prog, "fused_gemm_add_v1");
-            cl::Kernel kernel_gemm_v2(prog, "fused_gemm_add_v2");
+            cl::Kernel kernel_gemm(prog, "gemv_int4_fp32");
 
-            // gemm_int4_fp32 param
+            // gemv_int4_fp32 param
             {
-              gemm_int4_fp32(A, B, scale, C_expect, m, k, n, group_size);
+              gemv_int4_fp32(A, B, scale, bias, C_expect, m, n, group_size);
 
-              queue.enqueueWriteBuffer(BBuf, CL_TRUE, 0, k * n * sizeof(float), B);
-              queue.enqueueWriteBuffer(BiasBuf, CL_TRUE, 0, m * n * sizeof(float), Bias);
 
-              globalSize = {n, m}, localSize = {32, 16};
+
+              globalSize = {m}, localSize = {64};
               kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
-              kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, CBuf);
-              kernel_gemm.setArg(4, m), kernel_gemm.setArg(5, k);
-              kernel_gemm.setArg(6, n);// kernel_gemm.setArg(7, group_size);
+              kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
+              kernel_gemm.setArg(4, CBuf);
+              kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
+              kernel_gemm.setArg(7, group_size);
               timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
 
               queue.finish();
-              queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * n * sizeof(float), C);
+              queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
               queue.finish();
 
-              matrix_transpose(C, C_T, n, m, false);
+              // matrix_transpose(C, C_T, n, m, false);
             }
 
-            // // fused_gemm_v1 param
-            // {
-            //   _ASSERT(group_size == 32);
-
-            //   gemm_add_q4_gs32(A, B, scale, C_expect, Bias, m, k, n);
-
-            //   matrix_transpose(B, B_T, k, n);
-            //   matrix_transpose(Bias, Bias_T, m, n);
-
-            //   queue.enqueueWriteBuffer(BBuf, CL_TRUE, 0, k * n * sizeof(float), B_T);
-            //   queue.enqueueWriteBuffer(BiasBuf, CL_TRUE, 0, m * n * sizeof(float), Bias_T);
-
-            //   globalSize = {m, n}, localSize = {16, 16};
-            //   kernel_gemm_v1.setArg(0, m), kernel_gemm_v1.setArg(1, n);
-            //   kernel_gemm_v1.setArg(2, k), kernel_gemm_v1.setArg(3, ABuf);
-            //   kernel_gemm_v1.setArg(4, BBuf), kernel_gemm_v1.setArg(5, scaleBuf);
-            //   kernel_gemm_v1.setArg(6, BiasBuf), kernel_gemm_v1.setArg(7, CBuf);
-            //   timed = run_kernel(queue, kernel_gemm_v1, globalSize, localSize, iters);
-
-            //   queue.finish();
-            //   queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * n * sizeof(float), C);
-            //   queue.finish();
-
-            //   matrix_transpose(C, C_T, n, m);
-            // }
-            
-            // fused_gemm_v2 param
-            // {
-            //   _ASSERT(group_size == 32);
-
-            //   gemm_add_q4_gs32(A, B, scale, C_expect, Bias, m, k, n);
-
-            //   matrix_transpose(B, B_T, k, n);
-            //   matrix_transpose(Bias, Bias_T, m, n);
-
-            //   queue.enqueueWriteBuffer(BBuf, CL_TRUE, 0, k * n * sizeof(float), B_T);
-            //   queue.enqueueWriteBuffer(BiasBuf, CL_TRUE, 0, m * n * sizeof(float), Bias_T);
-
-            //   globalSize = {m / 2, n / 2}, localSize = {16, 16};
-            //   kernel_gemm_v2.setArg(0, m), kernel_gemm_v2.setArg(1, n);
-            //   kernel_gemm_v2.setArg(2, k), kernel_gemm_v2.setArg(3, ABuf);
-            //   kernel_gemm_v2.setArg(4, BBuf), kernel_gemm_v2.setArg(5, scaleBuf);
-            //   kernel_gemm_v2.setArg(6, BiasBuf), kernel_gemm_v2.setArg(7, CBuf);
-            //   timed = run_kernel(queue, kernel_gemm_v2, globalSize, localSize, iters);
-
-            //   queue.finish();
-            //   queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * n * sizeof(float), C);
-            //   queue.finish();
-
-            //   matrix_transpose(C, C_T, n, m);
-            // }
-            
-            
-            double gflops = 1.0 * m * k / timed  * n * 2 / 1e3;
-            double gbps = ((m * k * n) * 2 + m * n) / timed / 1e3;
-
             double L2norm = 0.0;
-            
-            for (int i = 0; i < m * n; i++) {
-                double val = C_T[i] - C_expect[i];
+
+            for (int i = 0; i < n; i++) {
+                double val = C[i] - C_expect[i];
                 L2norm += val*val;
+                if (L2norm > 1) {
+                  printf("c[%d] is %f, %f", i, C[i], C_expect[i]);
+                  break;
+                }
             }
 
             PRINT(NEWLINE);
-            double gflop = 2.0 * m * k * n / 1e9;
-            double gB= (2.0 * (m * k * n) + m * n) / 1e9;
-            printf("(%d, %d, %d) GEMM GFLOP: %f, GB: %f, compute intensity: %f\n", m, k, n, gflop, gB, gflop/gB);
+            double gflops = 2.0 * m * n / 1e9;
+            double gB= (2.0 * (m * n) + n) / 1e9;
+            printf("(%d, %d) GEMM GFLOP: %f, GB: %f, compute intensity: %f\n", m, n, gflops, gB, gflops/gB);
             printf("L2NORM is %.2f\n", L2norm);
-            // printf("c0 is %f, %f", C[0], C_expect[0]);
             PRINT("time is : ");
             PRINT(timed);
             PRINT("us, compute is : ");
             PRINT(gflops);
             PRINT(" GFlops, bandwidth is : ");
-            PRINT(gbps);
+            PRINT(gB);
             PRINT(" GB/s");
             PRINT(NEWLINE);
         }
@@ -347,8 +258,6 @@ int main(int argc, char **argv)
     free(C);
     free(C_expect);
     free(scale);
-    free(C_T);
-    free(Bias);
-    free(Bias_T);
+    free(bias);
     return 0;
 }
