@@ -146,7 +146,7 @@ void row_major2column_major_block(uint8_t* A, const int m, const int k, const in
   for (int i = 0; i < m; i++) {
     for (int j = 0; j < k; j++) {
       int src_idx = i * k + j;
-      int dst_idx = j * m + k;
+      int dst_idx = j * m + i;
       memcpy(Ac + dst_idx * block_byte, A + src_idx * block_byte, block_byte);
     }
   }
@@ -292,13 +292,42 @@ int main(int argc, char **argv)
             //   free(A_mix);
             // }
 
+            // {
+            //   uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
+            //   float* scale_mix = (float*)malloc(m * n / group_size * sizeof(float));
+            //   matrix_mix(A, A_mix, m, n, group_size);
+            //   queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
+            //   free(A_mix);
+            //   cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v3");
+            //   const int local_size = 64;
+            //   globalSize = {m}, localSize = {local_size};
+
+            //   cl::Buffer tmp = cl::Buffer(ctx, CL_MEM_READ_WRITE, local_size);
+
+            //   kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
+            //   kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
+            //   kernel_gemm.setArg(4, CBuf);
+            //   kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
+            //   kernel_gemm.setArg(7, group_size);
+            //   kernel_gemm.setArg(8, tmp);
+            //   timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
+
+            //   queue.finish();
+            //   queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
+            //   queue.finish();
+            // }
+
             {
               uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
+              float* scale_mix = (float*)malloc(m * n / group_size * sizeof(float));
               matrix_mix(A, A_mix, m, n, group_size);
-              // row_major2column_major_block(A_mix, m, n / group_size, group_size / 2);
+              row_major2column_major_block(A_mix, m, n / group_size, group_size / 2);
+              row_major2column_major(scale_mix, m, n / group_size);
               queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
+              // queue.enqueueWriteBuffer(scaleBuf, CL_TRUE, 0, m * n / group_size * sizeof(float), scale_mix);
               free(A_mix);
-              cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v3");
+              free(scale_mix);
+              cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v4");
               const int local_size = 64;
               globalSize = {m}, localSize = {local_size};
 
@@ -315,10 +344,7 @@ int main(int argc, char **argv)
               queue.finish();
               queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
               queue.finish();
-
-              // matrix_transpose(C, C_T, n, m, false);
             }
-
             double L2norm = 0.0;
 
             for (int i = 0; i < n; i++) {

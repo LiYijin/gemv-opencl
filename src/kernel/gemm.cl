@@ -76,9 +76,9 @@ __kernel void gemv_int4_fp32_v2(__global char *A, __global float *B, __global fl
 // 
 // every work-item process one row.
 // |16|0|  |17|1| .. 
+// block layout [0,0] [0, 1]
 __kernel void gemv_int4_fp32_v3(__global char *A, __global float4 *B, __global float *scale, __global float* bias, __global float* C, const int M, const int N, const int group_size, __local float* tmp)
 {
-    const int local_size = get_local_size(0);
     const int row = get_global_id(0);
     const int col_step = group_size;
     float acc = 0.0f;
@@ -94,7 +94,6 @@ __kernel void gemv_int4_fp32_v3(__global char *A, __global float4 *B, __global f
         float4 y03 = B[iybs + 3];
         float4 y13 = B[iybs + 7];
 
-        // const int ib = row +  col / group_size * get_num_groups(0) * get_local_size(0);
         const int ib = row * N / group_size +  col / group_size;
         const float sc = scale[ib];
         const int4 vui = *((__global int4*)(A) + ib);
@@ -118,5 +117,49 @@ __kernel void gemv_int4_fp32_v3(__global char *A, __global float4 *B, __global f
     C[row] = acc + bias[row]; 
 }
 
+// 
+// every work-item process one row.
+// |16|0|  |17|1| .. 
+// block layout [0,0] [1,0]
+__kernel void gemv_int4_fp32_v4(__global char *A, __global float4 *B, __global float *scale, __global float* bias, __global float* C, const int M, const int N, const int group_size, __local float* tmp)
+{
+    const int local_size = get_local_size(0);
+    const int row = get_global_id(0);
+    const int col_step = group_size;
+    float acc = 0.0f;
+    for (int col = 0; col < N; col += col_step) {
+        const int iybs = col / 4;
+
+        float4 y00 = B[iybs + 0];
+        float4 y10 = B[iybs + 4];
+        float4 y01 = B[iybs + 1];
+        float4 y11 = B[iybs + 5];
+        float4 y02 = B[iybs + 2];
+        float4 y12 = B[iybs + 6];
+        float4 y03 = B[iybs + 3];
+        float4 y13 = B[iybs + 7];
+
+        const int ib = row +  col / group_size * get_num_groups(0) * get_local_size(0);
+        const float sc = scale[row * N / group_size +  col / group_size];
+        const int4 vui = *((__global int4*)(A) + ib);
+        const float4 v00 = convert_float4((char)-8 + as_char4(vui.x & 0x0f0f0f0f));
+        const float4 v10 = convert_float4((char)-8 + as_char4((vui.x >> 4) & 0x0f0f0f0f));
+        const float4 v01 = convert_float4((char)-8 + as_char4(vui.y & 0x0f0f0f0f));
+        const float4 v11 = convert_float4((char)-8 + as_char4((vui.y >> 4) & 0x0f0f0f0f));
+        const float4 v02 = convert_float4((char)-8 + as_char4(vui.z & 0x0f0f0f0f));
+        const float4 v12 = convert_float4((char)-8 + as_char4((vui.z >> 4) & 0x0f0f0f0f));                
+        const float4 v03 = convert_float4((char)-8 + as_char4(vui.w & 0x0f0f0f0f));
+        const float4 v13 = convert_float4((char)-8 + as_char4((vui.w >> 4) & 0x0f0f0f0f));
+        acc += sc * dot(v00, y00);
+        acc += sc * dot(v10, y10);
+        acc += sc * dot(v01, y01);
+        acc += sc * dot(v11, y11);
+        acc += sc * dot(v02, y02);
+        acc += sc * dot(v12, y12);
+        acc += sc * dot(v03, y03);
+        acc += sc * dot(v13, y13);
+    }
+    C[row] = acc + bias[row]; 
+}
 
 )"
