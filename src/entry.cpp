@@ -98,14 +98,14 @@ void matrix_mix(uint8_t * ori, uint8_t * after, int m, int n, int group_size) {
         }
       }
     }
-    printf("\n");
-    for (int i = 0; i < 16;i++) {
-      printf(" %x(%d), ", ori[i], i);
-    }
-    printf("\n");
-    for (int i = 0; i < 16;i++) {
-      printf(" %x(%d), ", after[i],i);
-    }    
+    // printf("\n");
+    // for (int i = 0; i < 16;i++) {
+    //   printf(" %x(%d), ", ori[i], i);
+    // }
+    // printf("\n");
+    // for (int i = 0; i < 16;i++) {
+    //   printf(" %x(%d), ", after[i],i);
+    // }    
 }
 
 void initializeData(uint8_t* A, float* B, float* scale, float* C, float* bias, const int m, const int n, const int group_size) {
@@ -133,7 +133,7 @@ void row_major2column_major(T* A, const int m, const int k) {
   for (int i = 0; i < m; i++) {
     for (int j = 0; j < k; j++) {
       int src_idx = i * k + j;
-      int dst_idx = j * m + k;
+      int dst_idx = j * m + i;
       Ac[dst_idx] = A[src_idx];
     }
   }
@@ -152,6 +152,144 @@ void row_major2column_major_block(uint8_t* A, const int m, const int k, const in
   }
   memcpy(A, Ac, m * k * block_byte);
   free(Ac);
+}
+
+void print_log(const int m, const int n, double timed, const float* C, const float* C_expect) {
+    double L2norm = 0.0;
+
+    for (int i = 0; i < n; i++) {
+        double val = C[i] - C_expect[i];
+        L2norm += val*val;
+        if (L2norm > 1) {
+          printf("c[%d] is %f, %f", i, C[i], C_expect[i]);
+          break;
+        }
+    }
+    bool passed = false;
+    if (L2norm < 1e3) passed = true;
+    PRINT(NEWLINE);
+    double gflops = 2.0 * m * n / 1e9;
+    double gB= (2.0 * (m * n) + n) / 1e9;
+    // printf("(%d, %d) GEMM GFLOP: %f, GB: %f, compute intensity: %f\n", m, n, gflops, gB, gflops/gB);
+    printf("L2NORM is %.2f, ", L2norm);
+    if (passed) printf("PASSED\n");
+    else printf("FAILED\n");
+    PRINT("time is : ");
+    PRINT(timed);
+    PRINT("us, compute is : ");
+    PRINT(gflops);
+    PRINT(" GFlops, bandwidth is : ");
+    PRINT(gB / timed * 1e6);
+    PRINT(" GB/s");
+    PRINT(NEWLINE);  
+}
+
+void gemv_int4_fp32_v1_call(cl::Program prog, cl::CommandQueue queue, cl::Buffer ABuf, cl::Buffer BBuf, cl::Buffer scaleBuf, cl::Buffer biasBuf, cl::Buffer CBuf, float* C, float* C_expect, const int m, const int n, const int group_size, const int iters) {
+    cl::Kernel kernel_gemm(prog, "gemv_int4_fp32");
+    cl::NDRange globalSize = {(cl::size_type)m};
+    cl::NDRange localSize = {64};
+    kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
+    kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
+    kernel_gemm.setArg(4, CBuf);
+    kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
+    kernel_gemm.setArg(7, group_size);
+    double timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
+
+    queue.finish();
+    queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
+    queue.finish();
+    printf("*******gemv_int4_fp32_v1********");
+    print_log(m, n, timed, C, C_expect);
+}
+void gemv_int4_fp32_v2_call(cl::Program prog, cl::CommandQueue queue, cl::Context ctx, cl::Buffer ABuf, cl::Buffer BBuf, cl::Buffer scaleBuf, cl::Buffer biasBuf, cl::Buffer CBuf, float* C, float* C_expect, uint8_t* A, const int m, const int n, const int group_size, const int iters) {
+    cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v2");
+    const int local_size = 64;
+    cl::NDRange globalSize = {(cl::size_type)m * 64};
+    cl::NDRange localSize = {local_size};
+    uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
+    matrix_mix(A, A_mix, m, n, group_size);
+    queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
+
+    cl::Buffer tmp = cl::Buffer(ctx, CL_MEM_READ_WRITE, local_size);
+
+    kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
+    kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
+    kernel_gemm.setArg(4, CBuf);
+    kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
+    kernel_gemm.setArg(7, group_size);
+    kernel_gemm.setArg(8, tmp);
+    double timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
+
+    queue.finish();
+    queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
+    queue.finish();
+    free(A_mix);
+
+    printf("*******gemv_int4_fp32_v2********");
+    print_log(m, n, timed, C, C_expect);
+}
+
+void gemv_int4_fp32_v3_call(cl::Program prog, cl::CommandQueue queue, cl::Context ctx, cl::Buffer ABuf, cl::Buffer BBuf, cl::Buffer scaleBuf, cl::Buffer biasBuf, cl::Buffer CBuf, float* C, float* C_expect, uint8_t* A, const int m, const int n, const int group_size, const int iters) {
+    uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
+    float* scale_mix = (float*)malloc(m * n / group_size * sizeof(float));
+    matrix_mix(A, A_mix, m, n, group_size);
+    queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
+    free(A_mix);
+    cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v3");
+    const int local_size = 64;
+    cl::NDRange globalSize = {(cl::size_type)m};
+    cl::NDRange localSize = {local_size};
+
+    cl::Buffer tmp = cl::Buffer(ctx, CL_MEM_READ_WRITE, local_size);
+
+    kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
+    kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
+    kernel_gemm.setArg(4, CBuf);
+    kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
+    kernel_gemm.setArg(7, group_size);
+    kernel_gemm.setArg(8, tmp);
+   double timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
+
+    queue.finish();
+    queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
+    queue.finish();
+
+    printf("*******gemv_int4_fp32_v3********");
+    print_log(m, n, timed, C, C_expect);
+}
+
+
+void gemv_int4_fp32_v4_call(cl::Program prog, cl::CommandQueue queue, cl::Context ctx, cl::Buffer ABuf, cl::Buffer BBuf, cl::Buffer scaleBuf, cl::Buffer biasBuf, cl::Buffer CBuf, float* C, float* C_expect, uint8_t* A, float* scale, const int m, const int n, const int group_size, const int iters) {
+    uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
+    float* scale_mix = (float*)malloc(m * n / group_size * sizeof(float));
+    matrix_mix(A, A_mix, m, n, group_size);
+    memcpy(scale_mix, scale, m * n / group_size * sizeof(float));
+    row_major2column_major_block(A_mix, m, n / group_size, group_size / 2);
+    row_major2column_major(scale_mix, m, n / group_size);
+    queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
+    queue.enqueueWriteBuffer(scaleBuf, CL_TRUE, 0, m * n / group_size * sizeof(float), scale_mix);
+    free(A_mix);
+    free(scale_mix);
+    cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v4");
+    const int local_size = 64;
+    cl::NDRange globalSize = {(cl::size_type)m};
+    cl::NDRange localSize = {local_size};
+
+    cl::Buffer tmp = cl::Buffer(ctx, CL_MEM_READ_WRITE, local_size);
+
+    kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
+    kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
+    kernel_gemm.setArg(4, CBuf);
+    kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
+    kernel_gemm.setArg(7, group_size);
+    kernel_gemm.setArg(8, tmp);
+    double timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
+
+    queue.finish();
+    queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
+    queue.finish();
+    printf("*******gemv_int4_fp32_v4********");
+    print_log(m, n, timed, C, C_expect);
 }
 
 int main(int argc, char **argv)
@@ -230,6 +368,7 @@ int main(int argc, char **argv)
             PRINT(devInfo.maxClockFreq);
             PRINT(NEWLINE);
             PRINT("clock_frequency_unit: MHz");
+            PRINT(NEWLINE);
             // PRINT(TAB TAB "Build Log: ", prog.getBuildInfo<CL_PROGRAM_BUILD_LOG>(devices[d]), NEWLINE NEWLINE);
 
             cl::CommandQueue queue = cl::CommandQueue(ctx, devices[d], CL_QUEUE_PROFILING_ENABLE);
@@ -244,131 +383,17 @@ int main(int argc, char **argv)
             queue.enqueueWriteBuffer(scaleBuf, CL_TRUE, 0, m * n / group_size * sizeof(float), scale);
             queue.enqueueWriteBuffer(BBuf, CL_TRUE, 0, n * sizeof(float), B);
             queue.enqueueWriteBuffer(biasBuf, CL_TRUE, 0, m * sizeof(float), bias);            
-            double timed = 0.0;
-
-            cl::NDRange globalSize, localSize;
 
             gemv_int4_fp32(A, B, scale, bias, C_expect, m, n, group_size);
+            // naive opencl uitlization. one work-item process one row.
+            gemv_int4_fp32_v1_call(prog, queue, ABuf, BBuf, scaleBuf, biasBuf, CBuf, C, C_expect, m, n, group_size, iters);
+            // llama.cpp uitlization. one work-group process one row.
+            gemv_int4_fp32_v2_call(prog, queue, ctx, ABuf, BBuf, scaleBuf, biasBuf, CBuf, C, C_expect, A, m, n, group_size, iters);
+            // optimization 1, layout between block is not transposed.
+            gemv_int4_fp32_v3_call(prog, queue, ctx, ABuf, BBuf, scaleBuf, biasBuf, CBuf, C, C_expect, A, m, n, group_size, iters);
+            // optimization 2, layout between block is transposed.
+            gemv_int4_fp32_v4_call(prog, queue, ctx, ABuf, BBuf, scaleBuf, biasBuf, CBuf, C, C_expect, A, scale, m, n, group_size, iters);
 
-            // gemv_int4_fp32 param
-            // {
-            //   cl::Kernel kernel_gemm(prog, "gemv_int4_fp32");
-            //   globalSize = {m}, localSize = {64};
-            //   kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
-            //   kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
-            //   kernel_gemm.setArg(4, CBuf);
-            //   kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
-            //   kernel_gemm.setArg(7, group_size);
-            //   timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
-
-            //   queue.finish();
-            //   queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
-            //   queue.finish();
-
-            //   // matrix_transpose(C, C_T, n, m, false);
-            // }
-            // llama.cpp kernel _v2
-            // {
-            //   uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
-            //   matrix_mix(A, A_mix, m, n, group_size);
-            //   queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
-            //   cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v2");
-            //   const int local_size = 64;
-            //   globalSize = {m * 64}, localSize = {64};
-
-            //   cl::Buffer tmp = cl::Buffer(ctx, CL_MEM_READ_WRITE, local_size);
-
-            //   kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
-            //   kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
-            //   kernel_gemm.setArg(4, CBuf);
-            //   kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
-            //   kernel_gemm.setArg(7, group_size);
-            //   kernel_gemm.setArg(8, tmp);
-            //   timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
-
-            //   queue.finish();
-            //   queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
-            //   queue.finish();
-            //   free(A_mix);
-            // }
-
-            // {
-            //   uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
-            //   float* scale_mix = (float*)malloc(m * n / group_size * sizeof(float));
-            //   matrix_mix(A, A_mix, m, n, group_size);
-            //   queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
-            //   free(A_mix);
-            //   cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v3");
-            //   const int local_size = 64;
-            //   globalSize = {m}, localSize = {local_size};
-
-            //   cl::Buffer tmp = cl::Buffer(ctx, CL_MEM_READ_WRITE, local_size);
-
-            //   kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
-            //   kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
-            //   kernel_gemm.setArg(4, CBuf);
-            //   kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
-            //   kernel_gemm.setArg(7, group_size);
-            //   kernel_gemm.setArg(8, tmp);
-            //   timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
-
-            //   queue.finish();
-            //   queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
-            //   queue.finish();
-            // }
-
-            {
-              uint8_t* A_mix = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
-              float* scale_mix = (float*)malloc(m * n / group_size * sizeof(float));
-              matrix_mix(A, A_mix, m, n, group_size);
-              row_major2column_major_block(A_mix, m, n / group_size, group_size / 2);
-              row_major2column_major(scale_mix, m, n / group_size);
-              queue.enqueueWriteBuffer(ABuf, CL_TRUE, 0, m * n / 2, A_mix);
-              // queue.enqueueWriteBuffer(scaleBuf, CL_TRUE, 0, m * n / group_size * sizeof(float), scale_mix);
-              free(A_mix);
-              free(scale_mix);
-              cl::Kernel kernel_gemm(prog, "gemv_int4_fp32_v4");
-              const int local_size = 64;
-              globalSize = {m}, localSize = {local_size};
-
-              cl::Buffer tmp = cl::Buffer(ctx, CL_MEM_READ_WRITE, local_size);
-
-              kernel_gemm.setArg(0, ABuf), kernel_gemm.setArg(1, BBuf);
-              kernel_gemm.setArg(2, scaleBuf), kernel_gemm.setArg(3, biasBuf);
-              kernel_gemm.setArg(4, CBuf);
-              kernel_gemm.setArg(5, m), kernel_gemm.setArg(6, n);
-              kernel_gemm.setArg(7, group_size);
-              kernel_gemm.setArg(8, tmp);
-              timed = run_kernel(queue, kernel_gemm, globalSize, localSize, iters);
-
-              queue.finish();
-              queue.enqueueReadBuffer(CBuf, CL_TRUE, 0, m * sizeof(float), C);
-              queue.finish();
-            }
-            double L2norm = 0.0;
-
-            for (int i = 0; i < n; i++) {
-                double val = C[i] - C_expect[i];
-                L2norm += val*val;
-                if (L2norm > 1) {
-                  printf("c[%d] is %f, %f", i, C[i], C_expect[i]);
-                  break;
-                }
-            }
-
-            PRINT(NEWLINE);
-            double gflops = 2.0 * m * n / 1e9;
-            double gB= (2.0 * (m * n) + n) / 1e9;
-            printf("(%d, %d) GEMM GFLOP: %f, GB: %f, compute intensity: %f\n", m, n, gflops, gB, gflops/gB);
-            printf("L2NORM is %.2f\n", L2norm);
-            PRINT("time is : ");
-            PRINT(timed);
-            PRINT("us, compute is : ");
-            PRINT(gflops);
-            PRINT(" GFlops, bandwidth is : ");
-            PRINT(gB / timed * 1e6);
-            PRINT(" GB/s");
-            PRINT(NEWLINE);
         }
     }
     free(A);

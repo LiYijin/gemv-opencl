@@ -139,8 +139,8 @@ __kernel void gemv_int4_fp32_v4(__global char *A, __global float4 *B, __global f
         float4 y03 = B[iybs + 3];
         float4 y13 = B[iybs + 7];
 
-        const int ib = row +  col / group_size * get_num_groups(0) * get_local_size(0);
-        const float sc = scale[row * N / group_size +  col / group_size];
+        const int ib = row +  col / group_size * M;
+        const float sc = scale[ib];
         const int4 vui = *((__global int4*)(A) + ib);
         const float4 v00 = convert_float4((char)-8 + as_char4(vui.x & 0x0f0f0f0f));
         const float4 v10 = convert_float4((char)-8 + as_char4((vui.x >> 4) & 0x0f0f0f0f));
