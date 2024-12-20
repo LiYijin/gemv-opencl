@@ -30,7 +30,55 @@ __kernel void gemv_int4_fp32(__global char *A, __global float *B, __global float
 // every group process one row.
 // work-item in on work-group process adjacent 
 // weight layout: |16|0|  |17|1| .. 
-__kernel void gemv_int4_fp32_v2(__global char *A, __global float *B, __global float *scale, __global float* bias, __global float* C, const int M, const int N, const int group_size, __local float* tmp)
+// As is organized as [scale, 32 data], [scale, 32 data]
+__kernel void gemv_int4_fp32_v2(__global char *As, __global float *B, __global float* bias, __global float* C, const int M, const int N, const int group_size, __local float* tmp, __global float* scale,  __global char* A)
+{
+  const int local_size = get_local_size(0);
+  const int row = get_group_id(0);
+  const int tid = get_local_id(0);
+  const int col_step = local_size * 2;
+  const int y_offset = group_size / 2;
+
+  tmp[tid] = 0;
+  for (int col = tid * 2; col < N; col += col_step) {
+      const int ib = (row * N + col) / group_size; // block index
+      const int iybs = col - col % group_size; // y block start index
+      const int iqs = (col % group_size) / 2; // quant index
+
+      // dequantize
+      float v0, v1;
+
+      // load scale value.
+      const float sc = *(__global float*)(As + ib * 20);
+
+      const uint8_t vui = As[(row * N + col) / 2 + (ib + 1) * 4];
+
+      v0 = ((vui & 0xF) - 8) * sc;
+      v1 = (((vui >> 4) & 0xF) - 8) * sc;
+
+      // matrix multiplication
+      tmp[tid] += v0 * B[iybs + iqs];
+      tmp[tid] += v1 * B[iybs + iqs + y_offset];
+  }
+
+  // sum up partial sums and write back result
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = local_size / 2; s > 0; s >>= 1) {
+      if (tid < s) {
+          tmp[tid] += tmp[tid + s];
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (tid == 0) {
+      C[row] = tmp[0] + bias[row];
+  }
+}
+
+// every group process one row.
+// work-item in on work-group process adjacent 
+// weight layout: |16|0|  |17|1| .. 
+// As is organized as [scale, 32 data], [scale, 32 data]
+__kernel void gemv_int4_fp32_v3(__global char *A, __global float *B, __global float *scale,__global float* bias, __global float* C, const int M, const int N, const int group_size, __local float* tmp)
 {
   const int local_size = get_local_size(0);
   const int row = get_group_id(0);
@@ -77,7 +125,7 @@ __kernel void gemv_int4_fp32_v2(__global char *A, __global float *B, __global fl
 // every work-item process one row.
 // |16|0|  |17|1| .. 
 // block layout [0,0] [0, 1]
-__kernel void gemv_int4_fp32_v3(__global char *A, __global float4 *B, __global float *scale, __global float* bias, __global float* C, const int M, const int N, const int group_size, __local float* tmp)
+__kernel void gemv_int4_fp32_v4(__global char *A, __global float4 *B, __global float *scale, __global float* bias, __global float* C, const int M, const int N, const int group_size)
 {
     const int row = get_global_id(0);
     const int col_step = group_size;
@@ -121,7 +169,7 @@ __kernel void gemv_int4_fp32_v3(__global char *A, __global float4 *B, __global f
 // every work-item process one row.
 // |16|0|  |17|1| .. 
 // block layout [0,0] [1,0]
-__kernel void gemv_int4_fp32_v4(__global char *A, __global float4 *B, __global float *scale, __global float* bias, __global float* C, const int M, const int N, const int group_size, __local float* tmp)
+__kernel void gemv_int4_fp32_v5(__global char *A, __global float4 *B, __global float *scale, __global float* bias, __global float* C, const int M, const int N, const int group_size)
 {
     const int local_size = get_local_size(0);
     const int row = get_global_id(0);
