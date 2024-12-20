@@ -301,7 +301,7 @@ int main(int argc, char **argv)
     // const int k = 4096;
     const int n = 4096;
     const int group_size = 32;
-    const int iters = 1;
+    const int iters = 100;
     uint8_t* A = (uint8_t*)malloc(m * n * sizeof(uint8_t) / 2);
     float* scale = (float*)malloc(m * n / group_size * sizeof(float));
 
